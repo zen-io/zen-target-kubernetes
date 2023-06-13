@@ -2,39 +2,58 @@ package k8s
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 
-	ahoy_targets "gitlab.com/hidothealth/platform/ahoy/src/target"
+	environs "github.com/zen-io/zen-core/environments"
+	zen_targets "github.com/zen-io/zen-core/target"
+	"github.com/zen-io/zen-core/utils"
 )
 
 type KubernetesConfig struct {
-	DeployDeps                []string `mapstructure:"deploy_deps"`
-	Toolchain                 *string  `mapstructure:"toolchain" desc:"Kubectl executable. Can be a ref or path"`
-	Namespace                 *string  `mapstructure:"namespace"`
-	ahoy_targets.BuildFields  `mapstructure:",squash"`
-	ahoy_targets.DeployFields `mapstructure:",squash"`
+	Name         string                           `mapstructure:"name" desc:"Name for the target"`
+	Description  string                           `mapstructure:"desc" desc:"Target description"`
+	Labels       []string                         `mapstructure:"labels" desc:"Labels to apply to the targets"`
+	Deps         []string                         `mapstructure:"deps" desc:"Build dependencies"`
+	PassEnv      []string                         `mapstructure:"pass_env" desc:"List of environment variable names that will be passed from the OS environment, they are part of the target hash"`
+	SecretEnv    []string                         `mapstructure:"secret_env" desc:"List of environment variable names that will be passed from the OS environment, they are not used to calculate the target hash"`
+	Env          map[string]string                `mapstructure:"env" desc:"Key-Value map of static environment variables to be used"`
+	Tools        map[string]string                `mapstructure:"tools" desc:"Key-Value map of tools to include when executing this target. Values can be references"`
+	Visibility   []string                         `mapstructure:"visibility" desc:"List of visibility for this target"`
+	Environments map[string]*environs.Environment `mapstructure:"environments" desc:"Deployment Environments"`
+	Srcs         []string                         `mapstructure:"srcs" desc:"Sources for the build"`
+	Outs         []string                         `mapstructure:"outs" desc:"Outs for the build"`
+	DeployDeps   []string                         `mapstructure:"deploy_deps"`
+	Urls         []string                         `mapstructure:"urls"`
+	Toolchain    *string                          `mapstructure:"toolchain" desc:"Kubectl executable. Can be a ref or path"`
+	Namespace    *string                          `mapstructure:"namespace"`
 }
 
-func (kc KubernetesConfig) GetTargets(tcc *ahoy_targets.TargetConfigContext) ([]*ahoy_targets.Target, error) {
+func (kc KubernetesConfig) GetTargets(tcc *zen_targets.TargetConfigContext) ([]*zen_targets.Target, error) {
 	srcs := map[string][]string{
-		"srcs": {},
+		"all": {},
 	}
 
 	outs := []string{}
 
 	for env := range kc.Environments {
+		outs = append(outs, env)
+
+		srcs[env] = []string{}
 		interpolVars := map[string]string{"ENV": env}
 
-		srcName := fmt.Sprintf("values_%s", env)
-		srcs[srcName] = []string{}
 		for _, src := range kc.Srcs {
-			if interpolated, err := tcc.Interpolate(src, interpolVars); err != nil {
+			interpolated, err := tcc.Interpolate(src, interpolVars)
+			if err != nil {
 				return nil, fmt.Errorf("interpolating src file %s: %w", src, err)
+			}
+
+			if strings.Contains(src, "{ENV}") {
+				srcs[env] = append(srcs[env], interpolated)
 			} else {
-				srcs[srcName] = append(srcs[srcName], interpolated)
-				outs = append(outs, filepath.Join(env, filepath.Base(interpolated)))
+				srcs["all"] = append(srcs[env], interpolated)
 			}
 		}
 	}
@@ -55,49 +74,85 @@ func (kc KubernetesConfig) GetTargets(tcc *ahoy_targets.TargetConfigContext) ([]
 		namespace = ""
 	}
 
-	opts := []ahoy_targets.TargetOption{
-		ahoy_targets.WithSrcs(srcs),
-		ahoy_targets.WithOuts(outs),
-		ahoy_targets.WithVisibility(kc.Visibility),
-		ahoy_targets.WithLabels(kc.Labels),
-		ahoy_targets.WithEnvironments(kc.Environments),
-		ahoy_targets.WithTools(map[string]string{"kubectl": toolchain}),
-		ahoy_targets.WithEnvVars(map[string]string{"NAMESPACE": namespace}),
-		ahoy_targets.WithTargetScript("build", &ahoy_targets.TargetScript{
-			Deps: kc.Deps,
-			Run: func(target *ahoy_targets.Target, runCtx *ahoy_targets.RuntimeContext) error {
-				for env := range target.Environments {
-					for _, sSrcs := range target.Srcs {
-						for _, src := range sSrcs {
-							from := src
-							to := filepath.Join(target.Cwd, env, filepath.Base(strings.TrimPrefix(src, target.Cwd)))
+	labels := make([]string, 0)
 
-							if err := ahoy_targets.CopyWithInterpolate(from, to, target, runCtx); err != nil {
-								return fmt.Errorf("interpolating while copying from %s to %s: %w", from, to, err)
-							}
+	for _, url := range kc.Urls {
+		if interpolated, err := tcc.Interpolate(url); err != nil {
+			return nil, fmt.Errorf("interpolating url %s: %w", url, err)
+		} else {
+			labels = append(labels, fmt.Sprintf("url:%s", interpolated))
+		}
+	}
+
+	opts := []zen_targets.TargetOption{
+		zen_targets.WithSrcs(srcs),
+		zen_targets.WithOuts(outs),
+		zen_targets.WithVisibility(kc.Visibility),
+		zen_targets.WithLabels(labels),
+		zen_targets.WithEnvironments(kc.Environments),
+		zen_targets.WithTools(map[string]string{"kubectl": toolchain}),
+		zen_targets.WithEnvVars(map[string]string{"NAMESPACE": namespace}),
+		zen_targets.WithTargetScript("build", &zen_targets.TargetScript{
+			Deps: kc.Deps,
+			Run: func(target *zen_targets.Target, runCtx *zen_targets.RuntimeContext) error {
+				for env := range target.Environments {
+					if err := os.MkdirAll(filepath.Join(target.Cwd, env), os.ModePerm); err != nil {
+						return err
+					}
+
+					for _, src := range append(target.Srcs["all"], target.Srcs[env]...) {
+						from := src
+						to := filepath.Join(target.Cwd, env, filepath.Base(strings.TrimPrefix(src, target.Cwd)))
+
+						if err := utils.CopyWithInterpolate(from, to, target.EnvVars()); err != nil {
+							return fmt.Errorf("interpolating while copying from %s to %s: %w", from, to, err)
 						}
 					}
 				}
 				return nil
 			},
 		}),
-		ahoy_targets.WithTargetScript("deploy", &ahoy_targets.TargetScript{
+		zen_targets.WithTargetScript("deploy", &zen_targets.TargetScript{
 			Deps: kc.DeployDeps,
-			Run: func(target *ahoy_targets.Target, runCtx *ahoy_targets.RuntimeContext) error {
-				execEnv := target.GetEnvironmentVariablesList()
-
-				args := []string{"apply", "--wait", "-n", namespace}
+			Pre: func(target *zen_targets.Target, runCtx *zen_targets.RuntimeContext) error {
+				args := []string{"apply", "--wait", "-f", runCtx.Env}
+				if namespace != "" {
+					args = append(args, "-n", namespace)
+				}
 
 				if runCtx.DryRun {
 					args = append(args, "--dry-run", "server")
 				}
 
-				for _, vf := range target.Srcs[fmt.Sprintf("values_%s", runCtx.Env)] {
-					args = append(args, "-f", filepath.Base(vf))
+				for _, label := range target.Labels {
+					if strings.HasPrefix(label, "url:") {
+						args = append(args, "-f", label[4:])
+					}
+				}
+
+				target.Env["ZEN_DEBUG_CMD"] = fmt.Sprintf("%s %s", target.Tools["kubectl"], strings.Join(args, " "))
+				return nil
+			},
+			Run: func(target *zen_targets.Target, runCtx *zen_targets.RuntimeContext) error {
+				execEnv := target.GetEnvironmentVariablesList()
+
+				args := []string{"apply", "--wait", "-f", runCtx.Env}
+				if namespace != "" {
+					args = append(args, "-n", namespace)
+				}
+
+				if runCtx.DryRun {
+					args = append(args, "--dry-run", "server")
+				}
+
+				for _, label := range target.Labels {
+					if strings.HasPrefix(label, "url:") {
+						args = append(args, "-f", label[4:])
+					}
 				}
 
 				kubeCmd := exec.Command(target.Tools["kubectl"], args...)
-				kubeCmd.Dir = fmt.Sprintf("%s/%s", target.Cwd, runCtx.Env)
+				kubeCmd.Dir = target.Cwd
 				kubeCmd.Env = execEnv
 				kubeCmd.Stdout = target
 				kubeCmd.Stderr = target
@@ -108,8 +163,8 @@ func (kc KubernetesConfig) GetTargets(tcc *ahoy_targets.TargetConfigContext) ([]
 				return nil
 			},
 		}),
-		ahoy_targets.WithTargetScript("remove", &ahoy_targets.TargetScript{
-			Run: func(target *ahoy_targets.Target, runCtx *ahoy_targets.RuntimeContext) error {
+		zen_targets.WithTargetScript("remove", &zen_targets.TargetScript{
+			Run: func(target *zen_targets.Target, runCtx *zen_targets.RuntimeContext) error {
 				execEnv := target.GetEnvironmentVariablesList()
 
 				args := []string{"remove", "--wait", "-n", namespace}
@@ -119,7 +174,7 @@ func (kc KubernetesConfig) GetTargets(tcc *ahoy_targets.TargetConfigContext) ([]
 				}
 
 				for _, vf := range target.Srcs[fmt.Sprintf("values_%s", runCtx.Env)] {
-					args = append(args, "-f", filepath.Base(vf))
+					args = append(args, "-f", vf)
 				}
 
 				kubeCmd := exec.Command(target.Tools["kubectl"], args...)
@@ -136,8 +191,8 @@ func (kc KubernetesConfig) GetTargets(tcc *ahoy_targets.TargetConfigContext) ([]
 		}),
 	}
 
-	return []*ahoy_targets.Target{
-		ahoy_targets.NewTarget(
+	return []*zen_targets.Target{
+		zen_targets.NewTarget(
 			kc.Name,
 			opts...,
 		),

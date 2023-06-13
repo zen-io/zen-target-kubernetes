@@ -6,24 +6,33 @@ import (
 	"path/filepath"
 	"strings"
 
-	ahoy_targets "gitlab.com/hidothealth/platform/ahoy/src/target"
-	"gitlab.com/hidothealth/platform/ahoy/src/utils"
+	environs "github.com/zen-io/zen-core/environments"
+	zen_targets "github.com/zen-io/zen-core/target"
+	"github.com/zen-io/zen-core/utils"
 )
 
 type HelmConfig struct {
-	Srcs                      []string `mapstructure:"srcs"`
-	DeployDeps                []string `mapstructure:"deploy_deps"`
-	ValuesFiles               []string `mapstructure:"values_files"`
-	Toolchain                 *string  `mapstructure:"toolchain"`
-	ReleaseName               string   `mapstructure:"release_name"`
-	Chart                     string   `mapstructure:"chart"`
-	Version                   *string  `mapstructure:"version"`
-	Namespace                 string   `mapstructure:"namespace"`
-	ahoy_targets.BaseFields   `mapstructure:",squash"`
-	ahoy_targets.DeployFields `mapstructure:",squash"`
+	Name         string                           `mapstructure:"name" desc:"Name for the target"`
+	Description  string                           `mapstructure:"desc" desc:"Target description"`
+	Labels       []string                         `mapstructure:"labels" desc:"Labels to apply to the targets"`
+	Deps         []string                         `mapstructure:"deps" desc:"Build dependencies"`
+	PassEnv      []string                         `mapstructure:"pass_env" desc:"List of environment variable names that will be passed from the OS environment, they are part of the target hash"`
+	SecretEnv    []string                         `mapstructure:"secret_env" desc:"List of environment variable names that will be passed from the OS environment, they are not used to calculate the target hash"`
+	Env          map[string]string                `mapstructure:"env" desc:"Key-Value map of static environment variables to be used"`
+	Tools        map[string]string                `mapstructure:"tools" desc:"Key-Value map of tools to include when executing this target. Values can be references"`
+	Visibility   []string                         `mapstructure:"visibility" desc:"List of visibility for this target"`
+	Environments map[string]*environs.Environment `mapstructure:"environments" desc:"Deployment Environments"`
+	Srcs         []string                         `mapstructure:"srcs"`
+	DeployDeps   []string                         `mapstructure:"deploy_deps"`
+	ValuesFiles  []string                         `mapstructure:"values_files"`
+	Toolchain    *string                          `mapstructure:"toolchain"`
+	ReleaseName  string                           `mapstructure:"release_name"`
+	Chart        string                           `mapstructure:"chart"`
+	Version      *string                          `mapstructure:"version"`
+	Namespace    string                           `mapstructure:"namespace"`
 }
 
-func (hc HelmConfig) GetTargets(tcc *ahoy_targets.TargetConfigContext) ([]*ahoy_targets.Target, error) {
+func (hc HelmConfig) GetTargets(tcc *zen_targets.TargetConfigContext) ([]*zen_targets.Target, error) {
 	srcs := map[string][]string{
 		"_srcs":  hc.Srcs,
 		"values": {},
@@ -40,38 +49,49 @@ func (hc HelmConfig) GetTargets(tcc *ahoy_targets.TargetConfigContext) ([]*ahoy_
 		toolchain = val
 	}
 
-	if ahoy_targets.IsTargetReference(hc.Chart) {
+	if zen_targets.IsTargetReference(hc.Chart) {
 		hc.Deps = append(hc.Deps, hc.Chart)
 		srcs["chart"] = []string{hc.Chart}
 		outs = append(outs, "chart/**/*")
 	}
 
-	return []*ahoy_targets.Target{
-		ahoy_targets.NewTarget(
+	hc.Labels = append(hc.Labels,
+		fmt.Sprintf("meta:release=%s", hc.ReleaseName),
+		fmt.Sprintf("meta:namespace=%s", hc.Namespace),
+		fmt.Sprintf("meta:chart=%s", hc.Chart),
+	)
+
+	if hc.Version != nil {
+		hc.Labels = append(hc.Labels, fmt.Sprintf("meta:version=%s", *hc.Version))
+	}
+
+	return []*zen_targets.Target{
+		zen_targets.NewTarget(
 			hc.Name,
-			ahoy_targets.WithSrcs(srcs),
-			ahoy_targets.WithOuts(outs),
-			ahoy_targets.WithEnvironments(hc.Environments),
-			ahoy_targets.WithTools(map[string]string{"helm": toolchain}),
-			ahoy_targets.WithPassEnv(hc.PassEnv),
-			ahoy_targets.WithTargetScript("build", &ahoy_targets.TargetScript{
+			zen_targets.WithSrcs(srcs),
+			zen_targets.WithOuts(outs),
+			zen_targets.WithLabels(hc.Labels),
+			zen_targets.WithEnvironments(hc.Environments),
+			zen_targets.WithTools(map[string]string{"helm": toolchain}),
+			zen_targets.WithPassEnv(hc.PassEnv),
+			zen_targets.WithTargetScript("build", &zen_targets.TargetScript{
 				Deps: hc.Deps,
-				Run: func(target *ahoy_targets.Target, runCtx *ahoy_targets.RuntimeContext) error {
+				Run: func(target *zen_targets.Target, runCtx *zen_targets.RuntimeContext) error {
 					for srcCat, sSrcs := range target.Srcs {
 						if srcCat == "chart" {
 							continue
 						}
 
 						for _, src := range sSrcs {
-							if err := ahoy_targets.CopyWithInterpolate(src, src, target, runCtx); err != nil {
+							if err := utils.CopyWithInterpolate(src, src, target.EnvVars()); err != nil {
 								return err
 							}
 						}
 					}
 
-					if ahoy_targets.IsTargetReference(hc.Chart) {
+					if zen_targets.IsTargetReference(hc.Chart) {
 						for _, src := range target.Srcs["chart"] {
-							to := filepath.Join(target.Cwd, "chart", strings.Join(strings.Split(src, "/")[1:], "/"))
+							to := filepath.Join(target.Cwd, "chart", strings.Join(strings.Split(target.StripCwd(src), "/")[1:], "/"))
 
 							if err := utils.Copy(src, to); err != nil {
 								return err
@@ -82,29 +102,39 @@ func (hc HelmConfig) GetTargets(tcc *ahoy_targets.TargetConfigContext) ([]*ahoy_
 					return nil
 				},
 			}),
-			ahoy_targets.WithTargetScript("deploy", &ahoy_targets.TargetScript{
+			zen_targets.WithTargetScript("deploy", &zen_targets.TargetScript{
 				Deps: hc.DeployDeps,
-				Pre: func(target *ahoy_targets.Target, runCtx *ahoy_targets.RuntimeContext) error {
+				Pre: func(target *zen_targets.Target, runCtx *zen_targets.RuntimeContext) error {
 					args, err := valuesToArgs(hc, target, runCtx)
 					if err != nil {
 						return err
 					}
+					args = append(args, hc.ReleaseName)
 					args = append(args, prepareCmdArgs(hc, target, runCtx)...)
-					args = append(args, hc.ReleaseName, filepath.Join(target.Cwd, "chart"))
+					if zen_targets.IsTargetReference(hc.Chart) {
+						args = append(args, filepath.Join(target.Cwd, "chart"))
+					} else {
+						args = append(args, hc.Chart)
+					}
 					if hc.Version != nil {
 						args = append(args, "--version", *hc.Version)
 					}
 
 					target.Env["HELM_NAMESPACE"] = hc.Namespace
-					target.Env["AHOY_DEBUG_CMD"] = fmt.Sprintf("helm upgrade -i %s", strings.Join(args, " "))
+					target.Env["ZEN_DEBUG_CMD"] = fmt.Sprintf("helm upgrade -i %s", strings.Join(args, " "))
 					return nil
 				},
-				Run: func(target *ahoy_targets.Target, runCtx *ahoy_targets.RuntimeContext) error {
+				Run: func(target *zen_targets.Target, runCtx *zen_targets.RuntimeContext) error {
 					args, err := valuesToArgs(hc, target, runCtx)
 					if err != nil {
 						return err
 					}
-					args = append([]string{"upgrade", "-i", hc.ReleaseName, filepath.Join(target.Cwd, "chart")}, args...)
+					args = append([]string{"upgrade", "-i", hc.ReleaseName}, args...)
+					if zen_targets.IsTargetReference(hc.Chart) {
+						args = append(args, filepath.Join(target.Cwd, "chart"))
+					} else {
+						args = append(args, hc.Chart)
+					}
 					args = append(args, prepareCmdArgs(hc, target, runCtx)...)
 					if hc.Version != nil {
 						args = append(args, "--version", *hc.Version)
@@ -122,13 +152,13 @@ func (hc HelmConfig) GetTargets(tcc *ahoy_targets.TargetConfigContext) ([]*ahoy_
 					return nil
 				},
 			}),
-			ahoy_targets.WithTargetScript("remove", &ahoy_targets.TargetScript{
-				Pre: func(target *ahoy_targets.Target, runCtx *ahoy_targets.RuntimeContext) error {
+			zen_targets.WithTargetScript("remove", &zen_targets.TargetScript{
+				Pre: func(target *zen_targets.Target, runCtx *zen_targets.RuntimeContext) error {
 					target.Env["HELM_NAMESPACE"] = hc.Namespace
-					target.Env["AHOY_DEBUG_CMD"] = "helm uninstall " + hc.ReleaseName
+					target.Env["ZEN_DEBUG_CMD"] = "helm uninstall " + hc.ReleaseName
 					return nil
 				},
-				Run: func(target *ahoy_targets.Target, runCtx *ahoy_targets.RuntimeContext) error {
+				Run: func(target *zen_targets.Target, runCtx *zen_targets.RuntimeContext) error {
 					args := append([]string{"uninstall", hc.ReleaseName}, prepareCmdArgs(hc, target, runCtx)...)
 
 					helmCmd := exec.Command(target.Tools["helm"], args...)
@@ -147,7 +177,7 @@ func (hc HelmConfig) GetTargets(tcc *ahoy_targets.TargetConfigContext) ([]*ahoy_
 	}, nil
 }
 
-func prepareCmdArgs(hc HelmConfig, target *ahoy_targets.Target, runCtx *ahoy_targets.RuntimeContext) []string {
+func prepareCmdArgs(hc HelmConfig, target *zen_targets.Target, runCtx *zen_targets.RuntimeContext) []string {
 	args := []string{"--wait"}
 
 	if runCtx.Debug {
@@ -161,7 +191,7 @@ func prepareCmdArgs(hc HelmConfig, target *ahoy_targets.Target, runCtx *ahoy_tar
 	return args
 }
 
-func valuesToArgs(hc HelmConfig, target *ahoy_targets.Target, runCtx *ahoy_targets.RuntimeContext) ([]string, error) {
+func valuesToArgs(hc HelmConfig, target *zen_targets.Target, runCtx *zen_targets.RuntimeContext) ([]string, error) {
 	args := []string{}
 	for _, vf := range hc.ValuesFiles {
 		interpolatedVarFile, err := target.Interpolate(vf)
