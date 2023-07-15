@@ -2,7 +2,6 @@ package k8s
 
 import (
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -140,16 +139,7 @@ func (hc HelmConfig) GetTargets(tcc *zen_targets.TargetConfigContext) ([]*zen_ta
 						args = append(args, "--version", *hc.Version)
 					}
 
-					helmCmd := exec.Command(target.Tools["helm"], args...)
-					helmCmd.Dir = target.Cwd
-					helmCmd.Env = target.GetEnvironmentVariablesList()
-					helmCmd.Stdout = target
-					helmCmd.Stderr = target
-					if err := helmCmd.Run(); err != nil {
-						return fmt.Errorf("executing deploy: %w", err)
-					}
-
-					return nil
+					return target.Exec(append([]string{target.Tools["helm"]}, args...), "helm deploy")
 				},
 			}),
 			zen_targets.WithTargetScript("remove", &zen_targets.TargetScript{
@@ -161,16 +151,7 @@ func (hc HelmConfig) GetTargets(tcc *zen_targets.TargetConfigContext) ([]*zen_ta
 				Run: func(target *zen_targets.Target, runCtx *zen_targets.RuntimeContext) error {
 					args := append([]string{"uninstall", hc.ReleaseName}, prepareCmdArgs(hc, target, runCtx)...)
 
-					helmCmd := exec.Command(target.Tools["helm"], args...)
-					helmCmd.Dir = target.Cwd
-					helmCmd.Env = target.GetEnvironmentVariablesList()
-					helmCmd.Stdout = target
-					helmCmd.Stderr = target
-					if err := helmCmd.Run(); err != nil {
-						return fmt.Errorf("executing deploy: %w", err)
-					}
-
-					return nil
+					return target.Exec(append([]string{target.Tools["helm"]}, args...), "helm remove")
 				},
 			}),
 		),

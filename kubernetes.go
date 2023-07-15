@@ -3,7 +3,6 @@ package k8s
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -42,7 +41,7 @@ func (kc KubernetesConfig) GetTargets(tcc *zen_targets.TargetConfigContext) ([]*
 		outs = append(outs, env)
 
 		srcs[env] = []string{}
-		interpolVars := map[string]string{"ENV": env}
+		interpolVars := map[string]string{"DEPLOY_ENV": env}
 
 		for _, src := range kc.Srcs {
 			interpolated, err := tcc.Interpolate(src, interpolVars)
@@ -50,7 +49,7 @@ func (kc KubernetesConfig) GetTargets(tcc *zen_targets.TargetConfigContext) ([]*
 				return nil, fmt.Errorf("interpolating src file %s: %w", src, err)
 			}
 
-			if strings.Contains(src, "{ENV}") {
+			if strings.Contains(src, "{DEPLOY_ENV}") {
 				srcs[env] = append(srcs[env], interpolated)
 			} else {
 				srcs["all"] = append(srcs[env], interpolated)
@@ -104,7 +103,7 @@ func (kc KubernetesConfig) GetTargets(tcc *zen_targets.TargetConfigContext) ([]*
 						from := src
 						to := filepath.Join(target.Cwd, env, filepath.Base(strings.TrimPrefix(src, target.Cwd)))
 
-						if err := utils.CopyWithInterpolate(from, to, target.EnvVars()); err != nil {
+						if err := utils.CopyWithInterpolate(from, to, utils.MergeMaps(target.EnvVars(), map[string]string{"DEPLOY_ENV": env})); err != nil {
 							return fmt.Errorf("interpolating while copying from %s to %s: %w", from, to, err)
 						}
 					}
@@ -134,9 +133,7 @@ func (kc KubernetesConfig) GetTargets(tcc *zen_targets.TargetConfigContext) ([]*
 				return nil
 			},
 			Run: func(target *zen_targets.Target, runCtx *zen_targets.RuntimeContext) error {
-				execEnv := target.GetEnvironmentVariablesList()
-
-				args := []string{"apply", "--wait", "-f", runCtx.Env}
+				args := []string{target.Tools["kubectl"], "apply", "--wait", "-f", runCtx.Env}
 				if namespace != "" {
 					args = append(args, "-n", namespace)
 				}
@@ -151,23 +148,12 @@ func (kc KubernetesConfig) GetTargets(tcc *zen_targets.TargetConfigContext) ([]*
 					}
 				}
 
-				kubeCmd := exec.Command(target.Tools["kubectl"], args...)
-				kubeCmd.Dir = target.Cwd
-				kubeCmd.Env = execEnv
-				kubeCmd.Stdout = target
-				kubeCmd.Stderr = target
-				if err := kubeCmd.Run(); err != nil {
-					return fmt.Errorf("executing deploy: %w", err)
-				}
-
-				return nil
+				return target.Exec(args, "kube apply")
 			},
 		}),
 		zen_targets.WithTargetScript("remove", &zen_targets.TargetScript{
 			Run: func(target *zen_targets.Target, runCtx *zen_targets.RuntimeContext) error {
-				execEnv := target.GetEnvironmentVariablesList()
-
-				args := []string{"remove", "--wait", "-n", namespace}
+				args := []string{target.Tools["kubectl"], "remove", "--wait", "-n", namespace}
 
 				if runCtx.DryRun {
 					args = append(args, "--dry-run", "server")
@@ -177,16 +163,7 @@ func (kc KubernetesConfig) GetTargets(tcc *zen_targets.TargetConfigContext) ([]*
 					args = append(args, "-f", vf)
 				}
 
-				kubeCmd := exec.Command(target.Tools["kubectl"], args...)
-				kubeCmd.Dir = fmt.Sprintf("%s/%s", target.Cwd, runCtx.Env)
-				kubeCmd.Env = execEnv
-				kubeCmd.Stdout = target
-				kubeCmd.Stderr = target
-				if err := kubeCmd.Run(); err != nil {
-					return fmt.Errorf("executing deploy: %w", err)
-				}
-
-				return nil
+				return target.Exec(args, "kube rm")
 			},
 		}),
 	}
