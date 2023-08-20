@@ -27,7 +27,7 @@ type HelmChartConfig struct {
 	Hashes      []string          `mapstructure:"hashes"`
 }
 
-func (hmc HelmChartConfig) GetTargets(tcc *zen_targets.TargetConfigContext) ([]*zen_targets.Target, error) {
+func (hmc HelmChartConfig) GetTargets(tcc *zen_targets.TargetConfigContext) ([]*zen_targets.TargetBuilder, error) {
 	if hmc.Path != nil {
 		fc := files.FilegroupConfig{
 			Srcs:            []string{fmt.Sprintf("%s/**/*", *hmc.Path)},
@@ -35,7 +35,7 @@ func (hmc HelmChartConfig) GetTargets(tcc *zen_targets.TargetConfigContext) ([]*
 			Labels:          hmc.Labels,
 			Deps:            hmc.Deps,
 			Visibility:      hmc.Visibility,
-			NoInterpolation: true,
+			NoCacheInterpolation: true,
 		}
 		return fc.GetTargets(tcc)
 	} else {
@@ -48,7 +48,7 @@ func (hmc HelmChartConfig) GetTargets(tcc *zen_targets.TargetConfigContext) ([]*
 			toolchain = val
 		}
 
-		pullCmd := fmt.Sprintf("helm pull -d {PWD} --untar --version %s", *hmc.Version)
+		pullCmd := fmt.Sprintf("helm pull -d {CWD} --untar --version %s", *hmc.Version)
 		if hmc.Repo != nil {
 			pullCmd = fmt.Sprintf("%s --repo %s", pullCmd, *hmc.Repo)
 		}
@@ -66,7 +66,7 @@ func (hmc HelmChartConfig) GetTargets(tcc *zen_targets.TargetConfigContext) ([]*
 			Labels:          hmc.Labels,
 			Deps:            hmc.Deps,
 			Visibility:      hmc.Visibility,
-			NoInterpolation: true,
+			NoCacheInterpolation: true,
 			Outs:            []string{filepath.Base(hmc.Chart) + "/**/*"},
 			BuildCommand:    []string{fmt.Sprintf("%s %s", pullCmd, hmc.Chart)},
 			Tools:           map[string]string{"helm": toolchain},

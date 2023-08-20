@@ -2,6 +2,7 @@ package k8s
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -11,33 +12,34 @@ import (
 )
 
 type HelmConfig struct {
-	Name         string                           `mapstructure:"name" desc:"Name for the target"`
-	Description  string                           `mapstructure:"desc" desc:"Target description"`
-	Labels       []string                         `mapstructure:"labels" desc:"Labels to apply to the targets"`
-	Deps         []string                         `mapstructure:"deps" desc:"Build dependencies"`
-	PassEnv      []string                         `mapstructure:"pass_env" desc:"List of environment variable names that will be passed from the OS environment, they are part of the target hash"`
-	SecretEnv    []string                         `mapstructure:"secret_env" desc:"List of environment variable names that will be passed from the OS environment, they are not used to calculate the target hash"`
-	Env          map[string]string                `mapstructure:"env" desc:"Key-Value map of static environment variables to be used"`
-	Tools        map[string]string                `mapstructure:"tools" desc:"Key-Value map of tools to include when executing this target. Values can be references"`
-	Visibility   []string                         `mapstructure:"visibility" desc:"List of visibility for this target"`
-	Environments map[string]*environs.Environment `mapstructure:"environments" desc:"Deployment Environments"`
-	Srcs         []string                         `mapstructure:"srcs"`
-	DeployDeps   []string                         `mapstructure:"deploy_deps"`
-	ValuesFiles  []string                         `mapstructure:"values_files"`
-	Toolchain    *string                          `mapstructure:"toolchain"`
-	ReleaseName  string                           `mapstructure:"release_name"`
-	Chart        string                           `mapstructure:"chart"`
-	Version      *string                          `mapstructure:"version"`
-	Namespace    string                           `mapstructure:"namespace"`
+	Name          string                           `mapstructure:"name" zen:"yes" desc:"Name for the target"`
+	Description   string                           `mapstructure:"desc" zen:"yes" desc:"Target description"`
+	Labels        []string                         `mapstructure:"labels" zen:"yes" desc:"Labels to apply to the targets"`
+	Deps          []string                         `mapstructure:"deps" zen:"yes" desc:"Build dependencies"`
+	PassEnv       []string                         `mapstructure:"pass_env" zen:"yes" desc:"List of environment variable names that will be passed from the OS environment, they are part of the target hash"`
+	PassSecretEnv []string                         `mapstructure:"secret_env" zen:"yes" desc:"List of environment variable names that will be passed from the OS environment, they are not used to calculate the target hash"`
+	Env           map[string]string                `mapstructure:"env" zen:"yes" desc:"Key-Value map of static environment variables to be used"`
+	Tools         map[string]string                `mapstructure:"tools" zen:"yes" desc:"Key-Value map of tools to include when executing this target. Values can be references"`
+	Visibility    []string                         `mapstructure:"visibility" zen:"yes" desc:"List of visibility for this target"`
+	Environments  map[string]*environs.Environment `mapstructure:"environments" zen:"yes" desc:"Deployment Environments"`
+	Args          map[string]string                `mapstructure:"args"`
+	Srcs          []string                         `mapstructure:"srcs"`
+	DeployDeps    []string                         `mapstructure:"deploy_deps"`
+	ValuesFiles   []string                         `mapstructure:"values_files"`
+	Toolchain     *string                          `mapstructure:"toolchain"`
+	ReleaseName   string                           `mapstructure:"release_name"`
+	Chart         string                           `mapstructure:"chart"`
+	Version       *string                          `mapstructure:"version"`
+	Namespace     string                           `mapstructure:"namespace"`
 }
 
-func (hc HelmConfig) GetTargets(tcc *zen_targets.TargetConfigContext) ([]*zen_targets.Target, error) {
+func (hc HelmConfig) GetTargets(tcc *zen_targets.TargetConfigContext) ([]*zen_targets.TargetBuilder, error) {
 	srcs := map[string][]string{
 		"_srcs":  hc.Srcs,
 		"values": {},
 	}
 
-	outs := hc.Srcs
+	outs := []string{"out/**"}
 
 	var toolchain string
 	if hc.Toolchain != nil {
@@ -60,127 +62,130 @@ func (hc HelmConfig) GetTargets(tcc *zen_targets.TargetConfigContext) ([]*zen_ta
 		fmt.Sprintf("meta:chart=%s", hc.Chart),
 	)
 
+	if hc.Args != nil {
+		for k, v := range hc.Args {
+			hc.Labels = append(hc.Labels, fmt.Sprintf("arg=%s=%s", k, v))
+		}
+	}
+
 	if hc.Version != nil {
 		hc.Labels = append(hc.Labels, fmt.Sprintf("meta:version=%s", *hc.Version))
 	}
 
-	return []*zen_targets.Target{
-		zen_targets.NewTarget(
-			hc.Name,
-			zen_targets.WithSrcs(srcs),
-			zen_targets.WithOuts(outs),
-			zen_targets.WithLabels(hc.Labels),
-			zen_targets.WithEnvironments(hc.Environments),
-			zen_targets.WithTools(map[string]string{"helm": toolchain}),
-			zen_targets.WithPassEnv(hc.PassEnv),
-			zen_targets.WithTargetScript("build", &zen_targets.TargetScript{
-				Deps: hc.Deps,
-				Run: func(target *zen_targets.Target, runCtx *zen_targets.RuntimeContext) error {
-					for srcCat, sSrcs := range target.Srcs {
-						if srcCat == "chart" {
-							continue
-						}
+	t := zen_targets.ToTarget(hc)
+	t.Srcs = srcs
+	t.Outs = outs
+	t.Tools["helm"] = toolchain
 
-						for _, src := range sSrcs {
-							if err := utils.CopyWithInterpolate(src, src, target.EnvVars()); err != nil {
-								return err
-							}
-						}
-					}
+	t.Scripts["build"] = &zen_targets.TargetBuilderScript{
+		Deps: hc.Deps,
+		Run: func(target *zen_targets.Target, runCtx *zen_targets.RuntimeContext) error {
+			os.MkdirAll(filepath.Join(target.Cwd, "out"), os.ModePerm)
+			for srcCat, sSrcs := range target.Srcs {
+				if srcCat == "chart" {
+					continue
+				}
 
-					if zen_targets.IsTargetReference(hc.Chart) {
-						for _, src := range target.Srcs["chart"] {
-							to := filepath.Join(target.Cwd, "chart", strings.Join(strings.Split(target.StripCwd(src), "/")[1:], "/"))
+				for _, src := range sSrcs {
+					to := filepath.Join(target.Cwd, "out", target.StripCwd(src))
 
-							if err := utils.Copy(src, to); err != nil {
-								return err
-							}
-						}
-					}
-
-					return nil
-				},
-			}),
-			zen_targets.WithTargetScript("deploy", &zen_targets.TargetScript{
-				Deps: hc.DeployDeps,
-				Pre: func(target *zen_targets.Target, runCtx *zen_targets.RuntimeContext) error {
-					args, err := valuesToArgs(hc, target, runCtx)
-					if err != nil {
+					if err := target.Copy(src, to); err != nil {
 						return err
 					}
-					args = append(args, hc.ReleaseName)
-					args = append(args, prepareCmdArgs(hc, target, runCtx)...)
-					if zen_targets.IsTargetReference(hc.Chart) {
-						args = append(args, filepath.Join(target.Cwd, "chart"))
-					} else {
-						args = append(args, hc.Chart)
-					}
-					if hc.Version != nil {
-						args = append(args, "--version", *hc.Version)
-					}
+				}
+			}
 
-					target.Env["HELM_NAMESPACE"] = hc.Namespace
-					target.Env["ZEN_DEBUG_CMD"] = fmt.Sprintf("helm upgrade -i %s", strings.Join(args, " "))
-					return nil
-				},
-				Run: func(target *zen_targets.Target, runCtx *zen_targets.RuntimeContext) error {
-					args, err := valuesToArgs(hc, target, runCtx)
-					if err != nil {
+			if zen_targets.IsTargetReference(hc.Chart) {
+				for _, src := range target.Srcs["chart"] {
+					to := filepath.Join(target.Cwd, "chart", strings.Join(strings.Split(target.StripCwd(src), "/")[1:], "/"))
+
+					if err := utils.Link(src, to); err != nil {
 						return err
 					}
-					args = append([]string{"upgrade", "-i", hc.ReleaseName}, args...)
-					if zen_targets.IsTargetReference(hc.Chart) {
-						args = append(args, filepath.Join(target.Cwd, "chart"))
-					} else {
-						args = append(args, hc.Chart)
-					}
-					args = append(args, prepareCmdArgs(hc, target, runCtx)...)
-					if hc.Version != nil {
-						args = append(args, "--version", *hc.Version)
+				}
+			}
+
+			return nil
+		},
+	}
+
+	t.Scripts["deploy"] = &zen_targets.TargetBuilderScript{
+		Deps: hc.DeployDeps,
+		Pre: func(target *zen_targets.Target, runCtx *zen_targets.RuntimeContext) error {
+			target.SetStatus(fmt.Sprintf("Deploying %s", target.Qn()))
+
+			args := []string{target.Tools["helm"], "upgrade", "-i"}
+			args = append(args, prepareCmdArgs(hc, runCtx)...)
+			args = append(args, hc.ReleaseName)
+
+			for _, vf := range hc.ValuesFiles {
+				interpolatedVarFile, err := target.Interpolate(vf)
+				if err != nil {
+					return err
+				}
+				args = append(args, "-f", filepath.Join("out", interpolatedVarFile))
+			}
+
+			if zen_targets.IsTargetReference(hc.Chart) {
+				args = append(args, filepath.Join(target.Cwd, "chart"))
+			} else if strings.HasPrefix(hc.Chart, "http") {
+				chart := filepath.Base(hc.Chart)
+				repo := strings.TrimSuffix(hc.Chart, "/"+chart)
+				args = append(args, fmt.Sprintf("--repo=%s", repo), chart)
+			} else {
+				args = append(args, hc.Chart)
+			}
+
+			if hc.Version != nil {
+				args = append(args, "--version", *hc.Version)
+			}
+
+			for _, label := range target.Labels {
+				if strings.HasPrefix(label, "arg=") {
+					argVal := strings.TrimPrefix(label, "arg=")
+					interpolatedArg, err := target.Interpolate(argVal)
+					if err != nil {
+						return fmt.Errorf("interpolating arg %s: %w", argVal, err)
 					}
 
-					return target.Exec(append([]string{target.Tools["helm"]}, args...), "helm deploy")
-				},
-			}),
-			zen_targets.WithTargetScript("remove", &zen_targets.TargetScript{
-				Pre: func(target *zen_targets.Target, runCtx *zen_targets.RuntimeContext) error {
-					target.Env["HELM_NAMESPACE"] = hc.Namespace
-					target.Env["ZEN_DEBUG_CMD"] = "helm uninstall " + hc.ReleaseName
-					return nil
-				},
-				Run: func(target *zen_targets.Target, runCtx *zen_targets.RuntimeContext) error {
-					args := append([]string{"uninstall", hc.ReleaseName}, prepareCmdArgs(hc, target, runCtx)...)
+					args = append(args, fmt.Sprintf("--set %s", interpolatedArg))
+				}
+			}
 
-					return target.Exec(append([]string{target.Tools["helm"]}, args...), "helm remove")
-				},
-			}),
-		),
-	}, nil
+			target.Env["HELM_NAMESPACE"] = hc.Namespace
+			target.Env["ZEN_DEBUG_CMD"] = strings.Join(args, " ")
+			return nil
+		},
+		Run: func(target *zen_targets.Target, runCtx *zen_targets.RuntimeContext) error {
+			return target.Exec(strings.Split(target.Env["ZEN_DEBUG_CMD"], " "), "helm deploy")
+		},
+	}
+	t.Scripts["remove"] = &zen_targets.TargetBuilderScript{
+		Pre: func(target *zen_targets.Target, runCtx *zen_targets.RuntimeContext) error {
+			target.Env["HELM_NAMESPACE"] = hc.Namespace
+			args := []string{target.Tools["helm"], "uninstall", hc.ReleaseName}
+			args = append(args, prepareCmdArgs(hc, runCtx)...)
+			target.Env["ZEN_DEBUG_CMD"] = strings.Join(args, " ")
+			return nil
+		},
+		Run: func(target *zen_targets.Target, runCtx *zen_targets.RuntimeContext) error {
+			return target.Exec(strings.Split(target.Env["ZEN_DEBUG_CMD"], " "), "helm remove")
+		},
+	}
+
+	return []*zen_targets.TargetBuilder{t}, nil
 }
 
-func prepareCmdArgs(hc HelmConfig, target *zen_targets.Target, runCtx *zen_targets.RuntimeContext) []string {
+func prepareCmdArgs(hc HelmConfig, runCtx *zen_targets.RuntimeContext) []string {
 	args := []string{"--wait"}
 
-	if runCtx.Debug {
-		args = append(args, "--debug")
-	}
+	// if runCtx.Debug {
+	// 	args = append(args, "--debug")
+	// }
 
 	if runCtx.DryRun {
 		args = append(args, "--dry-run")
 	}
 
 	return args
-}
-
-func valuesToArgs(hc HelmConfig, target *zen_targets.Target, runCtx *zen_targets.RuntimeContext) ([]string, error) {
-	args := []string{}
-	for _, vf := range hc.ValuesFiles {
-		interpolatedVarFile, err := target.Interpolate(vf)
-		if err != nil {
-			return nil, err
-		}
-		args = append(args, "-f", interpolatedVarFile)
-	}
-
-	return args, nil
 }
